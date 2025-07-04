@@ -2,21 +2,20 @@ import streamlit as st
 import pandas as pd
 import tempfile
 import os
-import urllib
-from sqlalchemy import create_engine
+import subprocess
 from zipfile import ZipFile
 import io
 
-# ⚙️ Connect to Access DB using sqlalchemy-access
-def connect_access_db(access_db):
-    conn_str = (
-        r'DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};'
-        f'DBQ={access_db};'
-    )
-    engine_url = f"access+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
-    return create_engine(engine_url)
+# 🛠️ Helper functions
+def extract_table_names(access_path):
+    result = subprocess.run(['mdb-tables', '-1', access_path], capture_output=True, text=True)
+    tables = result.stdout.strip().split('\n')
+    return [tbl for tbl in tables if tbl]
 
-# 🗝️ Generate keys for duplicate detection
+def export_table_to_csv(access_path, table_name, output_path):
+    with open(output_path, 'w') as f:
+        subprocess.run(['mdb-export', access_path, table_name], stdout=f)
+
 def generate_keys(df):
     df['key1'] = df['Invoice Date'].astype(str) + '_' + df['Gross Amount'].astype(str) + '_' + df['Supplier Number'].astype(str)
     df['key2'] = df['Invoice Number'].astype(str) + '_' + df['Gross Amount'].astype(str) + '_' + df['Supplier Number'].astype(str)
@@ -24,7 +23,6 @@ def generate_keys(df):
     df['key4'] = df['Invoice Date'].astype(str) + '_' + df['Gross Amount'].astype(str) + '_' + df['Supplier Number'].astype(str) + '_' + df['Invoice Number'].astype(str)
     return df
 
-# 🧠 Match each invoice against database entries
 def check_match(row, key_sets):
     if row['key4'] in key_sets['key4']:
         return pd.Series(['Yes', 'Date+Amount+Supplier+Number'])
@@ -37,73 +35,78 @@ def check_match(row, key_sets):
     else:
         return pd.Series(['No', 'UNIQUE'])
 
-# 🎬 UI Begins
-st.set_page_config(page_title="Access Converter & Duplicate Checker")
-st.title("📁 MS Access to CSV & Invoice Deduplication")
+# 🧠 App layout
+st.set_page_config(page_title="Access + Excel Invoice Deduplicator", layout="centered")
+st.title("📁 Access to CSV + Invoice Deduplication (mdbtools)")
 
-uploaded_file = st.file_uploader("Upload MS Access file (.mdb or .accdb)", type=["mdb", "accdb"])
+access_file = st.file_uploader("Upload your MS Access file (.mdb or .accdb)", type=["mdb", "accdb"])
+if access_file:
+    with st.spinner("Processing Access database..."):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mdb") as tmp:
+            tmp.write(access_file.getbuffer())
+            access_path = tmp.name
 
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.' + uploaded_file.name.split('.')[-1]) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        access_path = tmp.name
+        # 🔍 Extract table names
+        tables = extract_table_names(access_path)
+        if not tables:
+            st.error("No tables found in Access file.")
+        else:
+            first_table = tables[0]
 
-    try:
-        with st.spinner("Connecting to Access database..."):
-            engine = connect_access_db(access_path)
-            with engine.connect() as conn:
-                tables = conn.engine.table_names()
-                if not tables:
-                    st.error("No tables found.")
-                else:
-                    # 🔁 Convert to ZIP
-                    with tempfile.TemporaryDirectory() as tempdir:
-                        zip_path = os.path.join(tempdir, "tables_csv.zip")
-                        with ZipFile(zip_path, 'w') as zipf:
-                            for table in tables:
-                                df = pd.read_sql(f"SELECT * FROM [{table}]", conn)
-                                csv_path = os.path.join(tempdir, f"{table}.csv")
-                                df.to_csv(csv_path, index=False)
-                                zipf.write(csv_path, arcname=os.path.basename(csv_path))
-                        with open(zip_path, "rb") as f:
-                            st.download_button("📦 Download All Tables as ZIP", f.read(), "tables_csv.zip", "application/zip")
+            # 🔄 Convert all tables to CSV and ZIP
+            with tempfile.TemporaryDirectory() as tempdir:
+                zip_path = os.path.join(tempdir, "access_tables.zip")
+                with ZipFile(zip_path, 'w') as zipf:
+                    table_frames = {}
+                    for table in tables:
+                        csv_file = os.path.join(tempdir, f"{table}.csv")
+                        export_table_to_csv(access_path, table, csv_file)
+                        zipf.write(csv_file, arcname=f"{table}.csv")
 
-                    # 💾 Load first table for comparison
-                    base_query = f"SELECT [Invoice Number], [Invoice Date], [Gross Amount], [Supplier Number] FROM [{tables[0]}]"
-                    db_df = pd.read_sql(base_query, conn)
-                    db_df['Invoice Date'] = pd.to_datetime(db_df['Invoice Date'], errors='coerce')
-                    db_df = generate_keys(db_df)
+                        # Read first table for comparison
+                        if table == first_table:
+                            df = pd.read_csv(csv_file)
+                            df = df[['Invoice Number', 'Invoice Date', 'Gross Amount', 'Supplier Number']].dropna()
+                            df['Invoice Date'] = pd.to_datetime(df['Invoice Date'], errors='coerce')
+                            db_df = generate_keys(df)
+
+                # 📥 ZIP download
+                with open(zip_path, "rb") as f:
+                    st.download_button(
+                        label="📦 Download All Tables as ZIP",
+                        data=f.read(),
+                        file_name="access_tables.zip",
+                        mime="application/zip"
+                    )
+
+            os.remove(access_path)
+            st.success("✅ Access DB processed!")
+
+            # 🧮 Excel logic
+            st.subheader("📊 Upload Excel Invoice File for Comparison")
+            excel_file = st.file_uploader("Upload Excel file (.xlsx or .xls)", type=["xlsx", "xls"])
+            if excel_file:
+                try:
+                    excel_df = pd.read_excel(excel_file)
+                    excel_df.columns = excel_df.columns.str.strip()
+                    raw = excel_df[['Invoice Number', 'Invoice Date', 'Gross Amount', 'Supplier Number']].dropna()
+                    raw['Invoice Date'] = pd.to_datetime(raw['Invoice Date'], errors='coerce')
+                    raw = generate_keys(raw)
+
+                    # 🔎 Compare logic
                     key_sets = {key: set(db_df[key]) for key in ['key1', 'key2', 'key3', 'key4']}
-                    st.success("✅ Database loaded and converted.")
-    except Exception as e:
-        st.error(f"❌ Error accessing database: {e}")
-    finally:
-        os.remove(access_path)
+                    raw[['Duplicate', 'Match Logic']] = raw.apply(lambda row: check_match(row, key_sets), axis=1)
+                    st.success("✅ Comparison complete.")
+                    st.dataframe(raw)
 
-    # 📊 Upload Excel for duplicate checking
-    st.subheader("📄 Upload Excel Invoice File")
-    excel_file = st.file_uploader("Upload Excel file", type=["xlsx", "xls"])
-    if excel_file:
-        try:
-            raw_df = pd.read_excel(excel_file)
-            raw_df.columns = raw_df.columns.str.strip()
-            df = raw_df[['Invoice Number', 'Invoice Date', 'Gross Amount', 'Supplier Number']].copy()
-            df['Invoice Date'] = pd.to_datetime(df['Invoice Date'], errors='coerce')
-            df = df.dropna(subset=['Invoice Date'])
-            df = generate_keys(df)
-            with st.spinner("Checking for duplicates..."):
-                df[['Duplicate', 'Match Logic']] = df.apply(lambda row: check_match(row, key_sets), axis=1)
-            st.success("✅ Duplicate check complete.")
-            st.dataframe(df)
+                    # 📤 Excel download
+                    excel_buf = io.BytesIO()
+                    result = excel_df.copy()
+                    result['Duplicate'] = raw['Duplicate']
+                    result['Match Logic'] = raw['Match Logic']
+                    result.to_excel(excel_buf, index=False)
 
-            # 📥 Download Excel
-            excel_buf = io.BytesIO()
-            result_df = raw_df.copy()
-            result_df['Duplicate'] = df['Duplicate']
-            result_df['Match Logic'] = df['Match Logic']
-            result_df.to_excel(excel_buf, index=False)
+                    st.download_button("📥 Download Comparison Report", excel_buf.getvalue(), "invoice_duplicates.xlsx")
 
-            st.download_button("📥 Download Duplicate Report", excel_buf.getvalue(), "duplicates_report.xlsx")
-
-        except Exception as e:
-            st.error(f"❌ Error processing Excel file: {e}")
+                except Exception as e:
+                    st.error(f"❌ Error processing Excel file: {e}")
